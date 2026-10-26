@@ -67,6 +67,10 @@ sudo reboot
 
 Apply `patch/bc250-40cu-amdgpu.patch` to your kernel PKGBUILD patch set, rebuild, add the modprobe config.
 
+Alternatively, `scripts/bc250-enable-40cu-arch.sh` builds the patched out-of-tree `amdgpu` module for the running kernel, and `scripts/bc250-40cu-rebuild.sh` with `packaging/95-bc250-40cu-rebuild.hook` rebuilds it automatically after each `linux-cachyos` / `linux-cachyos-lts` upgrade.
+
+**Tested on CachyOS** (BC-250, PCI ID 0x13FE) with `linux-cachyos 7.3.0-4` (built with Clang/ThinLTO): RADV reports `num_cu = 40` and `cu_mask = 0x3ff` on all four shader arrays. Not yet verified on `linux-cachyos-lts`.
+
 ## Verification
 
 After reboot:
