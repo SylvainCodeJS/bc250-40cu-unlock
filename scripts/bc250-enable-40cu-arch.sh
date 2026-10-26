@@ -15,12 +15,16 @@
 
 set -euo pipefail
 
-KVER="$(uname -r)"
+KVER="${BC250_KVER:-$(uname -r)}"
 KVER_BASE="${KVER%%-*}"          # e.g. 6.9.3 from 6.9.3-arch1-1
 MODDIR="/usr/lib/modules/${KVER}"
 MODPATH="${MODDIR}/kernel/drivers/gpu/drm/amd/amdgpu/amdgpu.ko"
 MODSRC=""
-BUILDDIR="/tmp/bc250-40cu-build"
+# Keyed by KVER: the pacman hook rebuilds several installed kernels in one
+# run (one bc250-enable-40cu-arch.sh invocation per kernel), and a shared
+# path here would make a later kernel's build silently reuse an earlier
+# kernel's cached/patched source tree.
+BUILDDIR="/tmp/bc250-40cu-build/${KVER}"
 CONF40="/etc/modprobe.d/bc250-40cu.conf"
 BACKUP_SUFFIX=".bc250-backup-$(date +%Y%m%d)"
 BC250_PCI_ID="13fe"
@@ -82,6 +86,19 @@ write_cc_patch() {
 ENDCC
 }
 
+refresh_initramfs() {
+    if command -v limine-mkinitcpio >/dev/null 2>&1; then
+        info "Regenerating initramfs with limine-mkinitcpio..."
+        limine-mkinitcpio
+    elif command -v mkinitcpio >/dev/null 2>&1; then
+        info "Regenerating initramfs with mkinitcpio -P..."
+        mkinitcpio -P
+    else
+        warn "No initramfs generator found (limine-mkinitcpio/mkinitcpio)."
+        warn "Regenerate the initramfs manually before rebooting, or the change won't take effect."
+    fi
+}
+
 check_bc250() {
     if ! lspci -nn 2>/dev/null | grep -qi "${BC250_PCI_ID}"; then
         warn "No BC-250 (PCI ID 13fe) detected. This patch is BC-250 specific."
@@ -129,24 +146,36 @@ find_source() {
 
     # Download minimal amdgpu subtree directly from kernel.org
     local major="${KVER_BASE%%.*}"
-    local url="https://cdn.kernel.org/pub/linux/kernel/v${major}.x/linux-${KVER_BASE}.tar.xz"
-    info "Kernel source not found locally."
-    info "Downloading amdgpu source from kernel.org (~120 MB)..."
-    info "  ${url}"
+    # kernel.org publishes the *first* release of a stable series without the
+    # trailing ".0" (e.g. linux-7.3.tar.xz, not linux-7.3.0.tar.xz) but every
+    # later point release keeps the full X.Y.Z name. Try the exact version
+    # first, then fall back to the ".0"-stripped name.
+    local ver_candidates="${KVER_BASE}"
+    if [ "${KVER_BASE%.0}" != "${KVER_BASE}" ]; then
+        ver_candidates="${KVER_BASE} ${KVER_BASE%.0}"
+    fi
 
     mkdir -p "${BUILDDIR}/src"
-    if curl -fL --progress-bar "$url" | \
-        tar xJ -C "${BUILDDIR}/src" --strip-components=1 \
-            --wildcards \
-            '*/drivers/gpu/drm/amd/' \
-            '*/include/drm/' \
-            '*/include/uapi/drm/' \
-            2>/dev/null; then
-        if [ -f "${BUILDDIR}/src/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c" ]; then
-            MODSRC="${BUILDDIR}/src"
-            return 0
+    info "Kernel source not found locally."
+    local ver url
+    for ver in $ver_candidates; do
+        url="https://cdn.kernel.org/pub/linux/kernel/v${major}.x/linux-${ver}.tar.xz"
+        info "Downloading amdgpu source from kernel.org (~120 MB)..."
+        info "  ${url}"
+        if curl -fL --progress-bar "$url" | \
+            tar xJ -C "${BUILDDIR}/src" --strip-components=1 \
+                --wildcards \
+                '*/drivers/gpu/drm/amd/' \
+                '*/include/drm/' \
+                '*/include/uapi/drm/' \
+                2>/dev/null; then
+            if [ -f "${BUILDDIR}/src/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c" ]; then
+                MODSRC="${BUILDDIR}/src"
+                return 0
+            fi
         fi
-    fi
+        warn "  ...not found at that name."
+    done
 
     die "Cannot find kernel source for ${KVER_BASE}.
   Option 1: pacman -S asp && asp checkout linux   (then makepkg -o)
@@ -230,7 +259,18 @@ build_module() {
     fi
 
     info "Building amdgpu module for kernel ${KVER} (2-5 min)..."
-    make -C "$kbuild" M="$amdgpu_dir" -j"$(nproc)" modules 2>&1 | tail -10 >&2
+    # Only the mainline linux-cachyos kernel is built with Clang/ThinLTO
+    # (CONFIG_CC_IS_CLANG=y); linux-cachyos-lts is built with GCC
+    # (CONFIG_CC_IS_GCC=y). Forcing LLVM=1 on a GCC-built kernel makes Kbuild
+    # feed clang the GCC-specific cflags recorded for that kernel's build
+    # (-mpreferred-stack-boundary=3, -mrecord-mcount, -fconserve-stack, ...),
+    # which clang rejects outright. Detect the actual toolchain per-kernel
+    # instead of assuming it.
+    local llvm_arg=""
+    if grep -qs '^CONFIG_CC_IS_CLANG=y' "${kbuild}/include/config/auto.conf" 2>/dev/null; then
+        llvm_arg="LLVM=1"
+    fi
+    make -C "$kbuild" M="$amdgpu_dir" ${llvm_arg} -j"$(nproc)" modules 2>&1 | tail -20 >&2
     local make_rc=${PIPESTATUS[0]}
 
     [ "$trace_copied" -eq 1 ] && rm -f "$trace_dst"
@@ -273,6 +313,7 @@ install_module() {
 
     depmod -a "$KVER"
     info "Module installed at ${target}"
+    refresh_initramfs
 }
 
 do_build() {
@@ -296,6 +337,7 @@ do_enable() {
         rm -f "$CONF40"
         exit 1
     fi
+    refresh_initramfs
     info "Rebooting..."
     sleep 2
     reboot
@@ -303,6 +345,7 @@ do_enable() {
 
 do_disable() {
     rm -f "$CONF40"
+    refresh_initramfs
     info "40 CU config removed. Rebooting to stock 24 CU..."
     sleep 2
     reboot
@@ -317,6 +360,7 @@ do_restore() {
     cp "$backup" "$target"
     rm -f "$CONF40"
     depmod -a "$KVER"
+    refresh_initramfs
     info "Original module restored. Reboot to apply."
 }
 

@@ -1,0 +1,14 @@
+[Trigger]
+Type = Package
+Operation = Install
+Operation = Upgrade
+Target = linux-cachyos
+Target = linux-cachyos-headers
+Target = linux-cachyos-lts
+Target = linux-cachyos-lts-headers
+
+[Action]
+Description = Reconstruction du patch BC-250 40 CU pour le nouveau noyau...
+When = PostTransaction
+Exec = /usr/local/bin/bc250-40cu-rebuild.sh
+NeedsTargets
